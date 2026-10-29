@@ -123,7 +123,8 @@ RISK_FREE_RATE=0.065
 ```
 
 Requires Node.js 22+. Run `npm run bench` to call every tool through the real MCP stdio
-transport and print cold/cached latency.
+transport and print cold/cached latency. See [TESTING.md](indiaquant-mcp/TESTING.md) for test
+prompts, expected outputs and timings.
 
 ### 3. Test the Server
 
