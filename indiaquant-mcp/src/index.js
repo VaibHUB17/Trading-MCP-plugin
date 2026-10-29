@@ -15,17 +15,20 @@ import {
 // Import modules
 import { fetchLivePrice } from './modules/marketData.js';
 import { fetchNewsSentiment, generateSignal } from './modules/signalGenerator.js';
-import { 
-  fetchOptionsChain, 
-  calculateGreeks, 
+import {
+  fetchOptionsChain,
+  calculateGreeks,
   detectUnusualActivity,
-  calculateMaxPain 
+  calculateMaxPain,
+  trimChainAroundATM
 } from './modules/optionsAnalyzer.js';
-import { 
-  placeVirtualTrade, 
-  getPortfolioPnL 
+import {
+  placeVirtualTrade,
+  getPortfolioPnL
 } from './modules/portfolioManager.js';
 import { getSectorHeatmap, scanMarket } from './modules/marketScanner.js';
+import { warmUp } from './utils/yahooClient.js';
+import cache from './utils/cache.js';
 import express from "express";
 
 /**
@@ -48,7 +51,7 @@ const TOOLS = [
   },
   {
     name: 'get_options_chain',
-    description: 'Fetch complete options chain with Greeks (Delta, Gamma, Theta, Vega) for calls and puts. Includes strike prices, open interest, volume, implied volatility, and calculated Greeks using Black-Scholes model.',
+    description: 'Fetch options chain with Greeks (Delta, Gamma, Theta, Vega) for calls and puts around the ATM strike. Includes strike prices, open interest, volume, implied volatility, calculated Black-Scholes Greeks, and max pain over the full chain. NSE options require UPSTOX_ACCESS_TOKEN.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -59,6 +62,10 @@ const TOOLS = [
         expiry: {
           type: 'string',
           description: 'Optional expiry date in YYYY-MM-DD format. If not provided, nearest expiry is used.',
+        },
+        strike_range: {
+          type: 'number',
+          description: 'Strikes to return on each side of ATM (default 10). Max pain always uses the full chain.',
         },
       },
       required: ['symbol'],
@@ -225,11 +232,12 @@ async function handleToolCall(name, args) {
       case 'get_live_price':
         return await fetchLivePrice(args.symbol);
 
-      case 'get_options_chain':
+      case 'get_options_chain': {
         const chainData = await fetchOptionsChain(args.symbol, args.expiry);
-        // Also calculate max pain
+        // Max pain needs every strike; the response only carries strikes near ATM
         const maxPain = calculateMaxPain(chainData);
-        return { ...chainData, maxPain };
+        return { ...trimChainAroundATM(chainData, args.strike_range || 10), maxPain };
+      }
 
       case 'analyze_sentiment':
         return await fetchNewsSentiment(args.symbol);
@@ -270,19 +278,46 @@ async function handleToolCall(name, args) {
 }
 
 /**
- * Express Server Setup
+ * Per-tool latency stats (exposed on /health)
  */
-const app = express();
+const toolStats = {};
+function recordLatency(name, ms, ok) {
+  const s = (toolStats[name] ||= { calls: 0, errors: 0, totalMs: 0, maxMs: 0 });
+  s.calls++;
+  if (!ok) s.errors++;
+  s.totalMs += ms;
+  s.maxMs = Math.max(s.maxMs, ms);
+}
 
-const PORT = process.env.PORT || 3000;
+/**
+ * Optional HTTP health endpoint (for hosting platforms that require a port).
+ * All logging goes to stderr: stdout is reserved for the MCP stdio protocol.
+ */
+function startHttpServer() {
+  const app = express();
+  const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => {
-  res.send("IndiaQuant MCP Server Running 🚀");
-});
+  app.get("/", (req, res) => {
+    res.send("IndiaQuant MCP Server Running 🚀");
+  });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  app.get("/health", (req, res) => {
+    const tools = Object.fromEntries(Object.entries(toolStats).map(([name, s]) => [
+      name,
+      { calls: s.calls, errors: s.errors, avgMs: Math.round(s.totalMs / s.calls), maxMs: s.maxMs },
+    ]));
+    res.json({ status: "ok", uptimeSec: Math.round(process.uptime()), cache: cache.getStats(), tools });
+  });
+
+  const httpServer = app.listen(PORT, () => {
+    console.error(`HTTP health server on port ${PORT}`);
+  });
+
+  // A busy port (e.g. a second MCP client instance) must not kill the MCP server
+  httpServer.on("error", (error) => {
+    console.error(`HTTP server disabled (${error.code || error.message}); MCP stdio is unaffected`);
+  });
+}
 
 /**
  * Main server initialization
@@ -293,7 +328,7 @@ async function main() {
   const server = new Server(
     {
       name: 'indiaquant-mcp',
-      version: '1.0.0',
+      version: '1.1.0',
     },
     {
       capabilities: {
@@ -312,18 +347,24 @@ async function main() {
   // Register tool execution handler
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    
-    console.error(`Executing tool: ${name}`);
-    
+
+    const started = Date.now();
     const result = await handleToolCall(name, args || {});
-    
+    const elapsed = Date.now() - started;
+    const isError = Boolean(result && result.error === true);
+
+    recordLatency(name, elapsed, !isError);
+    console.error(`Tool ${name} ${isError ? 'failed' : 'ok'} in ${elapsed}ms`);
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(result, null, 2),
+          // Compact JSON: pretty-printing adds ~30% tokens to every response
+          text: JSON.stringify(result),
         },
       ],
+      isError,
     };
   });
 
@@ -332,8 +373,12 @@ async function main() {
   await server.connect(transport);
 
   console.error('✓ IndiaQuant MCP Server is running');
-  console.error('✓ All 10 tools registered and ready');
-  console.error('✓ Virtual portfolio initialized');
+  console.error(`✓ All ${TOOLS.length} tools registered and ready`);
+
+  startHttpServer();
+
+  // Pre-establish the Yahoo session in the background so the first tool call is fast
+  warmUp();
 }
 
 // Error handling
@@ -342,9 +387,9 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
+// A stray rejected promise (e.g. a timed-out upstream call) should be logged, not crash the server
 process.on('unhandledRejection', (error) => {
   console.error('Unhandled rejection:', error);
-  process.exit(1);
 });
 
 // Start the server

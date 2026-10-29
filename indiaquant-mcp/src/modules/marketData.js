@@ -1,12 +1,21 @@
 /**
  * Market Data Module
  * Fetches live prices and historical OHLC data using yahoo-finance2
+ *
+ * Latency strategy:
+ *  - Live prices go through quoteCombine(): concurrent lookups (heatmap, scanner,
+ *    portfolio) are merged into a single batched HTTP request.
+ *  - If the quote endpoint fails (crumb/429), fall back to the chart endpoint,
+ *    which needs no crumb.
+ *  - Every fetch is cached with a market-hours-aware TTL and coalesced in-flight.
  */
 
-import yahooFinance from 'yahoo-finance2';
+import yahooFinance, { withTimeout } from '../utils/yahooClient.js';
 import { mapSymbol, isValidSymbol } from '../utils/symbolMapper.js';
 import cache from '../utils/cache.js';
 import { config } from '../config.js';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Check if market is currently open (IST timezone)
@@ -15,26 +24,105 @@ export function isMarketOpen() {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
   const istTime = new Date(now.getTime() + istOffset);
-  
+
   const day = istTime.getUTCDay();
   const hour = istTime.getUTCHours();
   const minute = istTime.getUTCMinutes();
-  
+
   // Weekend check (Saturday=6, Sunday=0)
   if (day === 0 || day === 6) return false;
-  
+
   // Market hours: 9:15 AM to 3:30 PM IST
   const currentMinutes = hour * 60 + minute;
   const marketStart = config.marketHours.start.hour * 60 + config.marketHours.start.minute;
   const marketEnd = config.marketHours.end.hour * 60 + config.marketHours.end.minute;
-  
+
   return currentMinutes >= marketStart && currentMinutes <= marketEnd;
+}
+
+/**
+ * Resolve a cache TTL (seconds) for the current market state
+ * @param {string} kind - Key of config.cacheTTL
+ */
+export function ttlFor(kind) {
+  const ttl = config.cacheTTL[kind];
+  return isMarketOpen() ? ttl.open : ttl.closed;
+}
+
+/**
+ * Primary source: batched quote endpoint
+ */
+async function loadQuote(yahooSymbol) {
+  const q = await withTimeout(
+    yahooFinance.quoteCombine(yahooSymbol),
+    config.timeouts.yahoo,
+    'Yahoo quote'
+  );
+  if (!q || q.regularMarketPrice == null) {
+    throw new Error('empty quote');
+  }
+
+  const price = q.regularMarketPrice;
+  return {
+    name: q.longName || q.shortName || null,
+    price,
+    change: q.regularMarketChange || 0,
+    changePct: q.regularMarketChangePercent || 0,
+    volume: q.regularMarketVolume || 0,
+    high: q.regularMarketDayHigh || price,
+    low: q.regularMarketDayLow || price,
+    open: q.regularMarketOpen || price,
+    previousClose: q.regularMarketPreviousClose || price,
+    marketCap: q.marketCap || 0,
+    fiftyTwoWeekHigh: q.fiftyTwoWeekHigh || 0,
+    fiftyTwoWeekLow: q.fiftyTwoWeekLow || 0,
+    currency: q.currency || 'INR',
+    source: 'yahoo-quote',
+  };
+}
+
+/**
+ * Fallback source: chart endpoint (no crumb required)
+ */
+async function loadQuoteFromChart(yahooSymbol) {
+  const chart = await withTimeout(
+    yahooFinance.chart(yahooSymbol, { period1: new Date(Date.now() - 7 * DAY_MS), interval: '1d' }),
+    config.timeouts.yahoo,
+    'Yahoo chart'
+  );
+  const meta = chart.meta;
+  if (!meta || meta.regularMarketPrice == null) {
+    throw new Error('empty chart');
+  }
+
+  const bars = (chart.quotes || []).filter(b => b.close != null);
+  const price = meta.regularMarketPrice;
+  const previousClose = bars.length >= 2 ? bars[bars.length - 2].close : (meta.chartPreviousClose || price);
+  const change = price - previousClose;
+  const lastBar = bars[bars.length - 1] || {};
+
+  return {
+    name: meta.longName || meta.shortName || null,
+    price,
+    change,
+    changePct: previousClose ? (change / previousClose) * 100 : 0,
+    volume: meta.regularMarketVolume || lastBar.volume || 0,
+    high: meta.regularMarketDayHigh || lastBar.high || price,
+    low: meta.regularMarketDayLow || lastBar.low || price,
+    open: lastBar.open || price,
+    previousClose,
+    marketCap: 0,
+    fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh || 0,
+    fiftyTwoWeekLow: meta.fiftyTwoWeekLow || 0,
+    currency: meta.currency || 'INR',
+    source: 'yahoo-chart',
+  };
 }
 
 /**
  * Fetch live price for a symbol
  * @param {string} symbol - Stock symbol (e.g., RELIANCE, TCS)
- * @returns {Promise<Object>} Price data
+ * @returns {Promise<Object>} Price data (changePct is in percent, e.g. 1.25 = +1.25%)
  */
 export async function fetchLivePrice(symbol) {
   try {
@@ -43,52 +131,33 @@ export async function fetchLivePrice(symbol) {
     }
 
     const yahooSymbol = mapSymbol(symbol);
-    const cacheKey = `price:${yahooSymbol}`;
-    
-    // Check cache first
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
 
-    // Fetch from Yahoo Finance
-    const quote = await yahooFinance.quoteSummary(yahooSymbol, { 
-      modules: ['price'],
-      timeout: 3000  // 10s → 3s (fail faster, retry faster)
+    const data = await cache.getOrSet(`price:${yahooSymbol}`, () => ttlFor('livePrice'), async () => {
+      let quote;
+      try {
+        quote = await loadQuote(yahooSymbol);
+      } catch (error) {
+        console.error(`Quote failed for ${yahooSymbol} (${error.message}), falling back to chart`);
+        quote = await loadQuoteFromChart(yahooSymbol);
+      }
+      return { ...quote, fetchedAt: new Date().toISOString() };
     });
-    const priceData = quote.price;
-    
-    if (!priceData || !priceData.regularMarketPrice) {
-      throw new Error(`No data available for ${symbol}`);
-    }
 
+    const marketOpen = isMarketOpen();
     const result = {
       symbol: symbol,
       yahooSymbol: yahooSymbol,
-      price: priceData.regularMarketPrice || 0,
-      change: priceData.regularMarketChange || 0,
-      changePct: priceData.regularMarketChangePercent || 0,
-      volume: priceData.regularMarketVolume || 0,
-      high: priceData.regularMarketDayHigh || priceData.regularMarketPrice || 0,
-      low: priceData.regularMarketDayLow || priceData.regularMarketPrice || 0,
-      open: priceData.regularMarketOpen || priceData.regularMarketPrice || 0,
-      previousClose: priceData.regularMarketPreviousClose || priceData.regularMarketPrice || 0,
-      marketCap: priceData.marketCap || 0,
-      fiftyTwoWeekHigh: priceData.fiftyTwoWeekHigh || 0,
-      fiftyTwoWeekLow: priceData.fiftyTwoWeekLow || 0,
-      timestamp: new Date().toISOString(),
-      marketOpen: isMarketOpen(),
-      currency: priceData.currency || 'INR',
+      ...data,
+      timestamp: data.fetchedAt,
+      marketOpen,
     };
+    delete result.fetchedAt;
 
     // If market is closed, add a note
-    if (!result.marketOpen) {
+    if (!marketOpen) {
       result.note = 'Market is closed. Showing last traded price.';
     }
 
-    // Cache the result
-    cache.set(cacheKey, result, config.cacheTTL.livePrice);
-    
     return result;
   } catch (error) {
     console.error(`Error fetching live price for ${symbol}:`, error.message);
@@ -111,44 +180,40 @@ export async function fetchOHLC(symbol, period = '1mo', interval = '1d') {
 
     const yahooSymbol = mapSymbol(symbol);
     const cacheKey = `ohlc:${yahooSymbol}:${period}:${interval}`;
-    
-    // Check cache first
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
 
-    // Fetch historical data
-    const result = await yahooFinance.chart(yahooSymbol, {
-      period1: getPeriodStartDate(period),
-      interval: interval,
+    return await cache.getOrSet(cacheKey, () => ttlFor('ohlc'), async () => {
+      const result = await withTimeout(
+        yahooFinance.chart(yahooSymbol, {
+          period1: getPeriodStartDate(period),
+          interval: interval,
+        }),
+        config.timeouts.yahoo,
+        'Yahoo chart'
+      );
+
+      if (!result || !result.quotes || result.quotes.length === 0) {
+        throw new Error(`No historical data available for ${symbol}`);
+      }
+
+      // Format the data
+      const ohlcData = result.quotes
+        .filter(q => q.open && q.high && q.low && q.close) // Filter out incomplete data
+        .map(quote => ({
+          date: quote.date ? new Date(quote.date).toISOString() : null,
+          timestamp: quote.date ? Math.floor(new Date(quote.date).getTime() / 1000) : null,
+          open: quote.open,
+          high: quote.high,
+          low: quote.low,
+          close: quote.close,
+          volume: quote.volume || 0,
+        }));
+
+      if (ohlcData.length === 0) {
+        throw new Error(`No valid OHLC data for ${symbol}`);
+      }
+
+      return ohlcData;
     });
-
-    if (!result || !result.quotes || result.quotes.length === 0) {
-      throw new Error(`No historical data available for ${symbol}`);
-    }
-
-    // Format the data
-    const ohlcData = result.quotes
-      .filter(q => q.open && q.high && q.low && q.close) // Filter out incomplete data
-      .map(quote => ({
-        date: quote.date ? new Date(quote.date).toISOString() : null,
-        timestamp: quote.date ? Math.floor(quote.date.getTime() / 1000) : null,
-        open: quote.open,
-        high: quote.high,
-        low: quote.low,
-        close: quote.close,
-        volume: quote.volume || 0,
-      }));
-
-    if (ohlcData.length === 0) {
-      throw new Error(`No valid OHLC data for ${symbol}`);
-    }
-
-    // Cache the result
-    cache.set(cacheKey, ohlcData, config.cacheTTL.ohlc);
-    
-    return ohlcData;
   } catch (error) {
     console.error(`Error fetching OHLC for ${symbol}:`, error.message);
     throw new Error(`Failed to fetch OHLC data for ${symbol}: ${error.message}`);
@@ -159,7 +224,6 @@ export async function fetchOHLC(symbol, period = '1mo', interval = '1d') {
  * Get period start date based on period string
  */
 function getPeriodStartDate(period) {
-  const now = new Date();
   const periodMap = {
     '1d': 1,
     '5d': 5,
@@ -173,31 +237,23 @@ function getPeriodStartDate(period) {
   };
 
   const days = periodMap[period] || 30;
-  const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-  return startDate;
+  return new Date(Date.now() - days * DAY_MS);
 }
 
 /**
- * Fetch multiple symbols at once
+ * Fetch multiple symbols at once (merged into one batched request by quoteCombine)
  * @param {string[]} symbols - Array of symbols
  * @returns {Promise<Object>} Object with symbol as key and price data as value
  */
 export async function fetchMultiplePrices(symbols) {
-  try {
-    const results = {};
-    const promises = symbols.map(async (symbol) => {
-      try {
-        results[symbol] = await fetchLivePrice(symbol);
-      } catch (error) {
-        results[symbol] = { error: true, message: error.message };
-      }
-    });
-
-    await Promise.all(promises);
-    return results;
-  } catch (error) {
-    throw new Error(`Failed to fetch multiple prices: ${error.message}`);
-  }
+  const settled = await Promise.allSettled(symbols.map(s => fetchLivePrice(s)));
+  const results = {};
+  settled.forEach((r, i) => {
+    results[symbols[i]] = r.status === 'fulfilled'
+      ? r.value
+      : { error: true, message: r.reason.message };
+  });
+  return results;
 }
 
 /**
@@ -208,29 +264,23 @@ export async function fetchMultiplePrices(symbols) {
 export async function fetchCompanyInfo(symbol) {
   try {
     const yahooSymbol = mapSymbol(symbol);
-    const cacheKey = `info:${yahooSymbol}`;
-    
-    // Check cache (24 hour TTL for company info)
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
 
-    const quote = await yahooFinance.quoteSummary(yahooSymbol, {
-      modules: ['price', 'summaryDetail']
+    return await cache.getOrSet(`info:${yahooSymbol}`, () => ttlFor('companyInfo'), async () => {
+      const quote = await withTimeout(
+        yahooFinance.quoteSummary(yahooSymbol, { modules: ['price', 'assetProfile'] }),
+        config.timeouts.yahoo,
+        'Yahoo quoteSummary'
+      );
+
+      return {
+        symbol: symbol,
+        name: quote.price?.longName || quote.price?.shortName || symbol,
+        sector: quote.assetProfile?.sector || 'N/A',
+        industry: quote.assetProfile?.industry || 'N/A',
+        marketCap: quote.price?.marketCap || 0,
+        currency: quote.price?.currency || 'INR',
+      };
     });
-
-    const result = {
-      symbol: symbol,
-      name: quote.price?.longName || quote.price?.shortName || symbol,
-      sector: quote.summaryDetail?.sector || 'N/A',
-      industry: quote.summaryDetail?.industry || 'N/A',
-      marketCap: quote.price?.marketCap || 0,
-      currency: quote.price?.currency || 'INR',
-    };
-
-    cache.set(cacheKey, result, 86400); // 24 hours
-    return result;
   } catch (error) {
     console.error(`Error fetching company info for ${symbol}:`, error.message);
     return {

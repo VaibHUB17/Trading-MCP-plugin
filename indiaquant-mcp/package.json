@@ -1,25 +1,35 @@
 {
   "name": "indiaquant-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Production-ready MCP server for Indian stock market intelligence and virtual trading",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "bench": "node scripts/bench.js",
+    "upstox-login": "node scripts/upstox-login.js"
   },
-  "keywords": ["mcp", "stock-market", "indian-stocks", "trading", "nse", "bse"],
+  "keywords": [
+    "mcp",
+    "stock-market",
+    "indian-stocks",
+    "trading",
+    "nse",
+    "bse"
+  ],
   "author": "IndiaQuant MCP",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "yahoo-finance2": "^2.11.3",
-    "technicalindicators": "^3.1.0",
     "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^5.3.0",
     "sql.js": "^1.10.3",
-    "dotenv": "^16.4.5"
+    "technicalindicators": "^3.1.0",
+    "yahoo-finance2": "^4.0.5"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }

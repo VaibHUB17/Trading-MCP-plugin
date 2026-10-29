@@ -1,11 +1,18 @@
 /**
- * In-memory TTL (Time-To-Live) cache implementation
- * Stores data with automatic expiration
+ * In-memory TTL (Time-To-Live) cache
+ * - Per-entry expiry
+ * - LRU eviction once maxEntries is reached (bounded memory)
+ * - Request coalescing: concurrent misses for the same key share one upstream call
+ * - Stale-on-error: if upstream fails, the last known value is served (flagged stale)
  */
 
 class Cache {
-  constructor() {
+  constructor({ maxEntries = 2000, staleGraceSec = 3600 } = {}) {
     this.store = new Map();
+    this.inflight = new Map();
+    this.maxEntries = maxEntries;
+    this.staleGraceMs = staleGraceSec * 1000;
+    this.stats = { hits: 0, misses: 0, coalesced: 0, staleServed: 0, evictions: 0 };
   }
 
   /**
@@ -15,60 +22,105 @@ class Cache {
    * @param {number} ttl - Time to live in seconds
    */
   set(key, value, ttl) {
-    const expiresAt = Date.now() + (ttl * 1000);
-    this.store.set(key, { value, expiresAt });
+    // Re-insert so Map order reflects recency (LRU)
+    this.store.delete(key);
+    this.store.set(key, { value, expiresAt: Date.now() + ttl * 1000 });
+
+    while (this.store.size > this.maxEntries) {
+      this.store.delete(this.store.keys().next().value);
+      this.stats.evictions++;
+    }
   }
 
   /**
-   * Get a cache entry
+   * Get a fresh cache entry
    * @param {string} key - Cache key
    * @returns {any|null} - Cached value or null if expired/not found
    */
   get(key) {
     const entry = this.store.get(key);
-    
-    if (!entry) return null;
-    
-    // Check if expired
-    if (Date.now() > entry.expiresAt) {
-      this.store.delete(key);
-      return null;
-    }
-    
+    if (!entry || Date.now() > entry.expiresAt) return null;
+
+    // Touch for LRU
+    this.store.delete(key);
+    this.store.set(key, entry);
     return entry.value;
   }
 
   /**
-   * Check if key exists and is not expired
+   * Get an entry even if expired, as long as it is within the stale grace window
+   */
+  getStale(key) {
+    const entry = this.store.get(key);
+    if (!entry || Date.now() > entry.expiresAt + this.staleGraceMs) return null;
+    return entry.value;
+  }
+
+  /**
+   * Return cached value or compute it once. Concurrent callers for the same key
+   * await the same promise instead of each hitting the upstream API.
    * @param {string} key - Cache key
-   * @returns {boolean}
+   * @param {number|function} ttl - TTL in seconds, or fn(value) => seconds
+   * @param {function} loader - async () => value
+   */
+  async getOrSet(key, ttl, loader) {
+    const cached = this.get(key);
+    if (cached !== null) {
+      this.stats.hits++;
+      return cached;
+    }
+
+    const pending = this.inflight.get(key);
+    if (pending) {
+      this.stats.coalesced++;
+      return pending;
+    }
+
+    this.stats.misses++;
+    const promise = (async () => {
+      try {
+        const value = await loader();
+        this.set(key, value, typeof ttl === 'function' ? ttl(value) : ttl);
+        return value;
+      } catch (error) {
+        const stale = this.getStale(key);
+        if (stale !== null) {
+          this.stats.staleServed++;
+          console.error(`[cache] serving stale ${key}: ${error.message}`);
+          return stale;
+        }
+        throw error;
+      } finally {
+        this.inflight.delete(key);
+      }
+    })();
+
+    this.inflight.set(key, promise);
+    return promise;
+  }
+
+  /**
+   * Check if key exists and is not expired
    */
   has(key) {
     return this.get(key) !== null;
   }
 
-  /**
-   * Delete a cache entry
-   * @param {string} key - Cache key
-   */
   delete(key) {
     this.store.delete(key);
   }
 
-  /**
-   * Clear all cache entries
-   */
   clear() {
     this.store.clear();
   }
 
   /**
-   * Clean up expired entries
+   * Remove entries that are past their stale grace window
    */
   cleanup() {
-    const now = Date.now();
+    const cutoff = Date.now() - this.staleGraceMs;
     for (const [key, entry] of this.store.entries()) {
-      if (now > entry.expiresAt) {
+      if (entry.expiresAt < cutoff) {
         this.store.delete(key);
       }
     }
@@ -78,22 +130,20 @@ class Cache {
    * Get cache statistics
    */
   getStats() {
-    let validEntries = 0;
-    let expiredEntries = 0;
     const now = Date.now();
-
+    let valid = 0;
     for (const entry of this.store.values()) {
-      if (now > entry.expiresAt) {
-        expiredEntries++;
-      } else {
-        validEntries++;
-      }
+      if (now <= entry.expiresAt) valid++;
     }
+    const lookups = this.stats.hits + this.stats.misses + this.stats.coalesced;
 
     return {
       total: this.store.size,
-      valid: validEntries,
-      expired: expiredEntries
+      valid,
+      expired: this.store.size - valid,
+      inflight: this.inflight.size,
+      ...this.stats,
+      hitRate: lookups > 0 ? +((this.stats.hits + this.stats.coalesced) / lookups).toFixed(3) : 0,
     };
   }
 }
@@ -101,9 +151,7 @@ class Cache {
 // Create singleton cache instance
 const cache = new Cache();
 
-// Clean up expired entries every 5 minutes
-setInterval(() => {
-  cache.cleanup();
-}, 5 * 60 * 1000);
+// Clean up expired entries every 5 minutes; unref so it never keeps the process alive
+setInterval(() => cache.cleanup(), 5 * 60 * 1000).unref();
 
 export default cache;

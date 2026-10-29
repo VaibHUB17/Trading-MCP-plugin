@@ -4,14 +4,10 @@
  */
 
 import initSqlJs from 'sql.js';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { fetchLivePrice } from './marketData.js';
 import { config } from '../config.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // Initialize database
 let db;
@@ -69,12 +65,23 @@ class DatabaseWrapper {
 }
 
 /**
- * Initialize SQLite database
+ * Initialize SQLite database (memoized: concurrent callers share one init)
  */
-export async function initializeDatabase() {
+let initPromise = null;
+export function initializeDatabase() {
+  if (!initPromise) {
+    initPromise = openDatabase().catch((error) => {
+      initPromise = null; // allow retry
+      throw error;
+    });
+  }
+  return initPromise;
+}
+
+async function openDatabase() {
   try {
     // Ensure data directory exists
-    const dataDir = join(__dirname, '..', '..', 'data');
+    const dataDir = dirname(config.dbPath);
     if (!existsSync(dataDir)) {
       mkdirSync(dataDir, { recursive: true });
     }
@@ -212,8 +219,8 @@ export async function placeVirtualTrade(params) {
       throw new Error('Missing required parameters: symbol, qty, side');
     }
 
-    if (qty <= 0) {
-      throw new Error('Quantity must be positive');
+    if (!Number.isInteger(qty) || qty <= 0) {
+      throw new Error('Quantity must be a positive whole number');
     }
 
     if (!['BUY', 'SELL'].includes(side.toUpperCase())) {
@@ -327,28 +334,25 @@ export async function getPortfolioPnL() {
       };
     }
 
-    // Fetch current prices for all positions
-    const pricePromises = positions.map(pos => fetchLivePrice(pos.symbol));
-    const priceData = await Promise.all(pricePromises);
+    // Fetch current prices for all positions (one batched request via quoteCombine).
+    // A failed lookup marks that position stale instead of failing the whole portfolio.
+    const priceResults = await Promise.allSettled(positions.map(pos => fetchLivePrice(pos.symbol)));
 
     // Calculate P&L for each position and check stop loss / target
     const positionDetails = [];
     let totalInvestment = 0;
-    let currentValue = 0;
+    let currentValue = 0; // net market value: longs minus shorts
     let totalUnrealizedPnL = 0;
 
     for (let i = 0; i < positions.length; i++) {
       const pos = positions[i];
-      const currentPrice = priceData[i].price;
-      
+      const priceOk = priceResults[i].status === 'fulfilled';
+      const currentPrice = priceOk ? priceResults[i].value.price : pos.avg_price;
+
       const investment = pos.avg_price * pos.qty;
       const value = currentPrice * pos.qty;
       const pnl = pos.side === 'BUY' ? (value - investment) : (investment - value);
       const pnlPct = (pnl / investment) * 100;
-
-      totalInvestment += investment;
-      currentValue += value;
-      totalUnrealizedPnL += pnl;
 
       // Check if stop loss or target hit
       let shouldClose = false;
@@ -373,9 +377,20 @@ export async function getPortfolioPnL() {
         }
       }
 
-      // Auto-close position if stop loss or target hit
+      // Never auto-close on a stale (fallback) price
+      if (!priceOk) {
+        shouldClose = false;
+        closeReason = null;
+      }
+
+      // Auto-close position if stop loss or target hit. Its proceeds move into
+      // cash, so it must not also be counted in the open totals below.
       if (shouldClose) {
         await closePosition(pos.id, currentPrice, closeReason);
+      } else {
+        totalInvestment += investment;
+        currentValue += pos.side === 'BUY' ? value : -value;
+        totalUnrealizedPnL += pnl;
       }
 
       positionDetails.push({
@@ -395,18 +410,18 @@ export async function getPortfolioPnL() {
         daysHeld: Math.floor((Date.now() - new Date(pos.entry_timestamp)) / (1000 * 60 * 60 * 24)),
         status: shouldClose ? 'CLOSED' : 'OPEN',
         closeReason: closeReason,
+        ...(priceOk ? {} : { priceError: priceResults[i].reason.message }),
       });
     }
 
-    // Calculate risk score based on position concentration and volatility
-    const positionSizes = positionDetails.map(p => p.investment);
-    const maxPosition = Math.max(...positionSizes);
-    const avgPosition = totalInvestment / positions.length;
+    // Calculate risk score based on concentration of the positions still open
+    const openPositions = positionDetails.filter(p => p.status === 'OPEN');
+    const maxPosition = openPositions.length > 0 ? Math.max(...openPositions.map(p => p.investment)) : 0;
     const concentration = totalInvestment > 0 ? (maxPosition / totalInvestment) * 100 : 0;
-    
+
     // Risk score: 0-100 (higher = riskier)
     // Based on concentration and number of positions
-    const diversificationScore = Math.max(0, 100 - (positions.length * 10));
+    const diversificationScore = openPositions.length > 0 ? Math.max(0, 100 - (openPositions.length * 10)) : 0;
     const concentrationScore = concentration;
     const riskScore = Math.min(100, (diversificationScore + concentrationScore) / 2);
 
@@ -414,9 +429,9 @@ export async function getPortfolioPnL() {
     const totalPortfolioValue = cashBalance.balance + currentValue;
 
     return {
-      openPositions: positionDetails.filter(p => p.status === 'OPEN'),
+      openPositions: openPositions,
       closedPositions: positionDetails.filter(p => p.status === 'CLOSED'),
-      totalPositions: positions.length,
+      totalPositions: openPositions.length,
       totalInvestment: totalInvestment,
       currentValue: currentValue,
       unrealizedPnL: totalUnrealizedPnL,
@@ -426,7 +441,7 @@ export async function getPortfolioPnL() {
       riskScore: riskScore,
       riskLevel: riskScore < 30 ? 'LOW' : riskScore < 60 ? 'MEDIUM' : 'HIGH',
       concentration: concentration.toFixed(2),
-      diversification: positions.length >= 5 ? 'GOOD' : positions.length >= 3 ? 'MODERATE' : 'POOR',
+      diversification: openPositions.length >= 5 ? 'GOOD' : openPositions.length >= 3 ? 'MODERATE' : 'POOR',
       timestamp: new Date().toISOString(),
     };
   } catch (error) {

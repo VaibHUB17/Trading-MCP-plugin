@@ -3,15 +3,13 @@
  * Options chain fetching, Greeks calculation, max pain, and unusual activity detection
  */
 
-import yahooFinance from 'yahoo-finance2';
+import yahooFinance, { withTimeout } from '../utils/yahooClient.js';
 import { mapSymbol } from '../utils/symbolMapper.js';
-import { 
-  calculateAllGreeks, 
-  calculateImpliedVolatility 
-} from '../utils/blackScholes.js';
-import { fetchOHLC } from './marketData.js';
+import { calculateAllGreeks } from '../utils/blackScholes.js';
+import { fetchOHLC, ttlFor } from './marketData.js';
 import { config } from '../config.js';
 import cache from '../utils/cache.js';
+import { fetchUpstoxOptionChain, isUpstoxConfigured, normalizeUnderlying } from '../utils/upstoxClient.js';
 
 /**
  * Calculate annualized historical volatility
@@ -37,6 +35,103 @@ function calculateHistoricalVolatility(prices) {
 }
 
 /**
+ * Build one option leg with Black-Scholes Greeks
+ */
+function buildLeg(raw, spotPrice, timeToExpiry, fallbackVol, type) {
+  const iv = raw.iv > 0 ? raw.iv : fallbackVol;
+  const greeks = calculateAllGreeks(spotPrice, raw.strike, timeToExpiry, config.riskFreeRate, iv, type);
+
+  return {
+    strike: raw.strike,
+    lastPrice: raw.lastPrice || 0,
+    bid: raw.bid || 0,
+    ask: raw.ask || 0,
+    volume: raw.volume || 0,
+    openInterest: raw.openInterest || 0,
+    impliedVolatility: iv,
+    inTheMoney: type === 'call' ? raw.strike < spotPrice : raw.strike > spotPrice,
+    contractSymbol: raw.contractSymbol,
+    ...greeks,
+  };
+}
+
+/**
+ * NSE options via Upstox (requires UPSTOX_ACCESS_TOKEN)
+ */
+async function loadFromUpstox(symbol, expiry) {
+  const chain = await fetchUpstoxOptionChain(symbol, expiry);
+  if (chain.rows.length === 0) {
+    throw new Error(`Upstox returned an empty chain for ${chain.underlying} ${chain.expiryDate}`);
+  }
+
+  const leg = (row, side) => {
+    const opt = row[side] || {};
+    const md = opt.market_data || {};
+    return {
+      strike: row.strike_price,
+      lastPrice: md.ltp,
+      bid: md.bid_price,
+      ask: md.ask_price,
+      volume: md.volume,
+      openInterest: md.oi,
+      iv: (opt.option_greeks?.iv || 0) / 100, // Upstox reports IV in percent
+      contractSymbol: opt.instrument_key,
+    };
+  };
+
+  return {
+    source: 'upstox',
+    spotPrice: chain.rows[0].underlying_spot_price,
+    expiryDate: chain.expiryDate,
+    availableExpiries: chain.availableExpiries,
+    lotSize: chain.lotSize,
+    calls: chain.rows.map(r => leg(r, 'call_options')),
+    puts: chain.rows.map(r => leg(r, 'put_options')),
+  };
+}
+
+/**
+ * Yahoo options (works for US tickers; Yahoo carries no NSE/BSE options)
+ */
+async function loadFromYahoo(symbol, expiry) {
+  const yahooSymbol = mapSymbol(symbol);
+  const data = await withTimeout(
+    yahooFinance.options(yahooSymbol, expiry ? { date: new Date(expiry) } : {}),
+    config.timeouts.yahoo,
+    'Yahoo options'
+  );
+  const chain = data?.options?.[0];
+
+  if (!chain || (chain.calls.length === 0 && chain.puts.length === 0)) {
+    throw new Error(
+      `No options data for ${symbol}. Yahoo Finance does not carry NSE/BSE options - ` +
+      'set UPSTOX_ACCESS_TOKEN in .env to enable NSE option chains (see README).'
+    );
+  }
+
+  const leg = (o) => ({
+    strike: o.strike,
+    lastPrice: o.lastPrice,
+    bid: o.bid,
+    ask: o.ask,
+    volume: o.volume,
+    openInterest: o.openInterest,
+    iv: o.impliedVolatility,
+    contractSymbol: o.contractSymbol,
+  });
+
+  return {
+    source: 'yahoo',
+    spotPrice: data.quote?.regularMarketPrice,
+    expiryDate: new Date(chain.expirationDate).toISOString().split('T')[0],
+    availableExpiries: (data.expirationDates || []).slice(0, 6).map(d => new Date(d).toISOString().split('T')[0]),
+    lotSize: null,
+    calls: chain.calls.map(leg),
+    puts: chain.puts.map(leg),
+  };
+}
+
+/**
  * Fetch options chain for a symbol
  * @param {string} symbol - Stock symbol
  * @param {string} expiry - Expiry date (optional, YYYY-MM-DD format)
@@ -44,106 +139,73 @@ function calculateHistoricalVolatility(prices) {
  */
 export async function fetchOptionsChain(symbol, expiry = null) {
   try {
-    const yahooSymbol = mapSymbol(symbol);
-    const cacheKey = `options:${yahooSymbol}:${expiry || 'nearest'}`;
-    
-    // Check cache
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
+    const cacheKey = `options:${normalizeUnderlying(symbol)}:${expiry || 'nearest'}`;
 
-    // Fetch options data
-    const optionsData = await yahooFinance.options(yahooSymbol, {
-      date: expiry || undefined
-    });
+    return await cache.getOrSet(cacheKey, () => ttlFor('optionsChain'), async () => {
+      // Chain and history (for HV fallback) in parallel
+      const [chain, ohlcData] = await Promise.all([
+        isUpstoxConfigured() ? loadFromUpstox(symbol, expiry) : loadFromYahoo(symbol, expiry),
+        fetchOHLC(symbol, '1mo', '1d').catch(() => null),
+      ]);
 
-    if (!optionsData || (!optionsData.calls && !optionsData.puts)) {
-      throw new Error(`No options data available for ${symbol}`);
-    }
+      const closes = ohlcData ? ohlcData.map(d => d.close) : [];
+      const historicalVol = calculateHistoricalVolatility(closes);
+      const spotPrice = chain.spotPrice || closes[closes.length - 1];
 
-    // Get spot price and historical volatility
-    const ohlcData = await fetchOHLC(symbol, '1mo', '1d');
-    const closes = ohlcData.map(d => d.close);
-    const spotPrice = closes[closes.length - 1];
-    const historicalVol = calculateHistoricalVolatility(closes);
+      // NSE options expire at 15:30 IST on expiry day
+      const expiryTime = new Date(`${chain.expiryDate}T15:30:00+05:30`);
+      const timeToExpiry = Math.max((expiryTime - Date.now()) / (1000 * 60 * 60 * 24 * 365), 1 / (365 * 24));
 
-    // Calculate time to expiry
-    const expiryDate = new Date(optionsData.expirationDate * 1000);
-    const now = new Date();
-    const timeToExpiry = (expiryDate - now) / (1000 * 60 * 60 * 24 * 365); // In years
-
-    // Process calls
-    const calls = (optionsData.calls || []).map(call => {
-      const greeks = calculateAllGreeks(
-        spotPrice,
-        call.strike,
-        timeToExpiry,
-        config.riskFreeRate,
-        call.impliedVolatility || historicalVol,
-        'call'
-      );
+      const calls = chain.calls.map(c => buildLeg(c, spotPrice, timeToExpiry, historicalVol, 'call'));
+      const puts = chain.puts.map(p => buildLeg(p, spotPrice, timeToExpiry, historicalVol, 'put'));
 
       return {
-        strike: call.strike,
-        lastPrice: call.lastPrice || 0,
-        bid: call.bid || 0,
-        ask: call.ask || 0,
-        volume: call.volume || 0,
-        openInterest: call.openInterest || 0,
-        impliedVolatility: call.impliedVolatility || historicalVol,
-        inTheMoney: call.inTheMoney || false,
-        contractSymbol: call.contractSymbol,
-        ...greeks,
+        symbol: symbol,
+        source: chain.source,
+        spotPrice: spotPrice,
+        expiryDate: chain.expiryDate,
+        availableExpiries: chain.availableExpiries,
+        lotSize: chain.lotSize,
+        daysToExpiry: Math.round(timeToExpiry * 365),
+        historicalVolatility: historicalVol,
+        calls: calls,
+        puts: puts,
+        callsCount: calls.length,
+        putsCount: puts.length,
+        timestamp: new Date().toISOString(),
       };
     });
-
-    // Process puts
-    const puts = (optionsData.puts || []).map(put => {
-      const greeks = calculateAllGreeks(
-        spotPrice,
-        put.strike,
-        timeToExpiry,
-        config.riskFreeRate,
-        put.impliedVolatility || historicalVol,
-        'put'
-      );
-
-      return {
-        strike: put.strike,
-        lastPrice: put.lastPrice || 0,
-        bid: put.bid || 0,
-        ask: put.ask || 0,
-        volume: put.volume || 0,
-        openInterest: put.openInterest || 0,
-        impliedVolatility: put.impliedVolatility || historicalVol,
-        inTheMoney: put.inTheMoney || false,
-        contractSymbol: put.contractSymbol,
-        ...greeks,
-      };
-    });
-
-    const result = {
-      symbol: symbol,
-      spotPrice: spotPrice,
-      expiryDate: expiryDate.toISOString().split('T')[0],
-      daysToExpiry: Math.round(timeToExpiry * 365),
-      historicalVolatility: historicalVol,
-      calls: calls,
-      puts: puts,
-      callsCount: calls.length,
-      putsCount: puts.length,
-      timestamp: new Date().toISOString(),
-    };
-
-    // Cache for 1 minute
-    cache.set(cacheKey, result, config.cacheTTL.optionsChain);
-
-    return result;
   } catch (error) {
     console.error(`Error fetching options chain for ${symbol}:`, error.message);
     throw new Error(`Failed to fetch options chain: ${error.message}`);
   }
+}
+
+/**
+ * Keep only the N strikes on each side of ATM.
+ * A full NIFTY chain is ~100+ strikes x 2 legs; returning all of it bloats the
+ * LLM context and response time without adding much signal.
+ * @param {Object} chain - Output of fetchOptionsChain
+ * @param {number} strikesEachSide - Strikes to keep above and below spot
+ */
+export function trimChainAroundATM(chain, strikesEachSide = 10) {
+  const strikes = [...new Set([...chain.calls, ...chain.puts].map(o => o.strike))].sort((a, b) => a - b);
+  if (strikes.length <= strikesEachSide * 2 + 1) return chain;
+
+  let atm = 0;
+  strikes.forEach((s, i) => {
+    if (Math.abs(s - chain.spotPrice) < Math.abs(strikes[atm] - chain.spotPrice)) atm = i;
+  });
+  const lo = strikes[Math.max(0, atm - strikesEachSide)];
+  const hi = strikes[Math.min(strikes.length - 1, atm + strikesEachSide)];
+  const inRange = o => o.strike >= lo && o.strike <= hi;
+
+  return {
+    ...chain,
+    calls: chain.calls.filter(inRange),
+    puts: chain.puts.filter(inRange),
+    strikeWindow: { atmStrike: strikes[atm], from: lo, to: hi, totalStrikes: strikes.length },
+  };
 }
 
 /**
@@ -324,15 +386,17 @@ export async function detectUnusualActivity(symbol) {
       return volumeRatio > 3 || volumeOIRatio > 0.5;
     }).sort((a, b) => b.volume - a.volume).slice(0, 10);
 
-    // Calculate volume-weighted average strike
-    const callVolumeStrike = optionsChain.calls.reduce((sum, c) => sum + c.strike * c.volume, 0) / 
-                              optionsChain.calls.reduce((sum, c) => sum + c.volume, 0);
-    const putVolumeStrike = optionsChain.puts.reduce((sum, p) => sum + p.strike * p.volume, 0) / 
-                             optionsChain.puts.reduce((sum, p) => sum + p.volume, 0);
-
     // Total volumes
     const totalCallVolume = optionsChain.calls.reduce((sum, c) => sum + c.volume, 0);
     const totalPutVolume = optionsChain.puts.reduce((sum, p) => sum + p.volume, 0);
+
+    // Calculate volume-weighted average strike (0 when there was no volume, e.g. pre-open)
+    const callVolumeStrike = totalCallVolume > 0
+      ? optionsChain.calls.reduce((sum, c) => sum + c.strike * c.volume, 0) / totalCallVolume
+      : 0;
+    const putVolumeStrike = totalPutVolume > 0
+      ? optionsChain.puts.reduce((sum, p) => sum + p.strike * p.volume, 0) / totalPutVolume
+      : 0;
     const volumeRatio = totalCallVolume > 0 ? totalPutVolume / totalCallVolume : 0;
 
     return {

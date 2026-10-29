@@ -8,20 +8,34 @@ const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, "..", ".env") });
 
 export const config = {
-  // API Keys
-  newsApiKey: process.env.NEWSAPI_KEY || "",
-  alphaVantageKey: process.env.ALPHA_VANTAGE_KEY || "",
+  // API Keys (all optional - core tools work without any key)
+  newsApiKey: process.env.NEWSAPI_KEY || "", // fallback news source
+  upstoxAccessToken: process.env.UPSTOX_ACCESS_TOKEN || "", // NSE options chain
 
   // Trading parameters
   riskFreeRate: parseFloat(process.env.RISK_FREE_RATE || "0.065"),
   initialCashBalance: 1000000, // ₹10 Lakh
 
-  // Cache TTLs (in seconds)
+  // Upstream request budgets (ms)
+  timeouts: {
+    yahoo: 4000,
+    news: 2500,
+    upstox: 5000,
+    instrumentMaster: 15000,
+  },
+
+  // Max parallel Yahoo requests (library default is 4)
+  yahooConcurrency: 10,
+
+  // Cache TTLs in seconds - short while the market is open, long once it is closed
+  // (prices cannot change after 15:30 IST, so refetching is wasted latency)
   cacheTTL: {
-     livePrice: 300,     // 30s → 5 minutes
-  ohlc: 900,          // 5min → 15 minutes
-  optionsChain: 180,  // 1min → 3 minutes
-  newsSentiment: 3600, // 30min → 1 hour
+    livePrice: { open: 15, closed: 600 },
+    ohlc: { open: 300, closed: 3600 },
+    optionsChain: { open: 60, closed: 900 },
+    newsSentiment: { open: 1800, closed: 3600 },
+    companyInfo: { open: 86400, closed: 86400 },
+    instrumentMaster: { open: 43200, closed: 43200 },
   },
 
   // Market hours (IST)
@@ -88,7 +102,7 @@ export const config = {
     "M&M",
     "TECHM",
     "ONGC",
-    "TATAMOTORS",
+    "TMPV", // Tata Motors PV - TATAMOTORS was demerged and now returns 404
     "ADANIPORTS",
     "COALINDIA",
     "INDUSINDBK",
@@ -108,12 +122,12 @@ export const config = {
     "APOLLOHOSP",
     "ADANIENT",
     "HDFCLIFE",
-    "LTIM",
+    "LTM", // LTIMindtree - renamed from LTIM
     "SHRIRAMFIN",
   ],
 
   // Database path
-  dbPath: join(__dirname, "..", "data", "portfolio.db"),
+  dbPath: process.env.DB_PATH || join(__dirname, "..", "data", "portfolio.db"),
 };
 
 // Sentiment keywords

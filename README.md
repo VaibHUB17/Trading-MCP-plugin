@@ -108,17 +108,22 @@ Create a `.env` file from the template:
 cp .env.example .env
 ```
 
-Edit `.env` and add your API keys:
+All keys are optional. Prices, signals, scanner, heatmap, sentiment (Google News RSS) and the
+virtual portfolio work with no keys at all.
 
 ```env
-# Get free API keys from:
-# NewsAPI: https://newsapi.org/register
-# Alpha Vantage: https://www.alphavantage.co/support/#api-key
+# NSE options chain (get_options_chain, detect_unusual_activity)
+# Yahoo Finance has no NSE/BSE options data, so these two tools need Upstox (free):
+# https://account.upstox.com/developer/apps
+UPSTOX_ACCESS_TOKEN=
 
-NEWSAPI_KEY=your_newsapi_key_here
-ALPHA_VANTAGE_KEY=your_alpha_vantage_key_here
+# Fallback news source only: https://newsapi.org/register
+NEWSAPI_KEY=
 RISK_FREE_RATE=0.065
 ```
+
+Requires Node.js 22+. Run `npm run bench` to call every tool through the real MCP stdio
+transport and print cold/cached latency.
 
 ### 3. Test the Server
 
@@ -131,7 +136,7 @@ You should see:
 ✓ Database initialized successfully
 ✓ IndiaQuant MCP Server is running
 ✓ All 10 tools registered and ready
-✓ Virtual portfolio initialized
+✓ Yahoo session warmed
 ```
 
 ### 4. Add to Claude Desktop
@@ -153,8 +158,7 @@ Add this configuration:
         "C:\\Users\\Vaibhav Shivhare\\Desktop\\susbspace\\indiaquant-mcp\\src\\index.js"
       ],
       "env": {
-        "NEWSAPI_KEY": "your_newsapi_key_here",
-        "ALPHA_VANTAGE_KEY": "your_alpha_vantage_key_here"
+        "UPSTOX_ACCESS_TOKEN": "your_upstox_token_here"
       }
     }
   }

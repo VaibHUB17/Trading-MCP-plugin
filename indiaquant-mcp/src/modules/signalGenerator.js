@@ -3,9 +3,9 @@
  * Technical analysis, pattern detection, sentiment analysis, and signal fusion
  */
 
-import { RSI, MACD, BollingerBands, EMA } from 'technicalindicators';
+import { RSI, MACD, BollingerBands } from 'technicalindicators';
 import axios from 'axios';
-import { fetchOHLC, fetchLivePrice } from './marketData.js';
+import { fetchOHLC, fetchLivePrice, ttlFor } from './marketData.js';
 import { config, sentimentKeywords } from '../config.js';
 import cache from '../utils/cache.js';
 
@@ -217,99 +217,152 @@ function findTroughs(data, window = 5) {
 }
 
 /**
- * Fetch news sentiment using NewsAPI
+ * Keyword sentiment score for a piece of text.
+ * Whole-word matching, so "up" does not match "update" and "cut" does not match "execute".
+ */
+const bullishRe = new RegExp(`\b(${sentimentKeywords.bullish.join('|')})\b`, 'g');
+const bearishRe = new RegExp(`\b(${sentimentKeywords.bearish.join('|')})\b`, 'g');
+
+function scoreText(text) {
+  const lower = text.toLowerCase();
+  return (lower.match(bullishRe) || []).length - (lower.match(bearishRe) || []).length;
+}
+
+function decodeEntities(str) {
+  return str
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'");
+}
+
+/**
+ * Build a news search query: company name is far more precise than tickers like "LT" or "ITC"
+ */
+async function buildNewsQuery(symbol) {
+  try {
+    const { name } = await fetchLivePrice(symbol);
+    if (name) {
+      const cleaned = name.replace(/\b(limited|ltd\.?)\s*$/i, '').trim();
+      return `"${cleaned}" stock`;
+    }
+  } catch {
+    // Fall through to the raw symbol
+  }
+  return `"${symbol}" stock NSE`;
+}
+
+/**
+ * Primary news source: Google News RSS (no API key, India edition, ~300-800ms)
+ */
+async function fetchGoogleNews(query) {
+  const url = 'https://news.google.com/rss/search?' + new URLSearchParams({
+    q: `${query} when:7d`,
+    hl: 'en-IN',
+    gl: 'IN',
+    ceid: 'IN:en',
+  });
+  const response = await axios.get(url, { timeout: config.timeouts.news, responseType: 'text' });
+  const items = [...response.data.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 15);
+
+  return items.map(([, item]) => {
+    const tag = (name) => decodeEntities(item.match(new RegExp(`<${name}[^>]*>([\s\S]*?)</${name}>`))?.[1] || '');
+    const source = tag('source');
+    // Google appends " - Source" to every title
+    const title = source && tag('title').endsWith(` - ${source}`)
+      ? tag('title').slice(0, -(source.length + 3))
+      : tag('title');
+    return {
+      title,
+      description: null,
+      url: tag('link'),
+      publishedAt: tag('pubDate') ? new Date(tag('pubDate')).toISOString() : null,
+      source,
+    };
+  });
+}
+
+/**
+ * Fallback news source: NewsAPI (needs NEWSAPI_KEY; free tier is 100 req/day)
+ */
+async function fetchNewsApi(query) {
+  const response = await axios.get('https://newsapi.org/v2/everything', {
+    params: {
+      q: query,
+      language: 'en',
+      sortBy: 'publishedAt',
+      pageSize: 15,
+      apiKey: config.newsApiKey,
+    },
+    timeout: config.timeouts.news,
+  });
+
+  return (response.data.articles || []).map(article => ({
+    title: article.title,
+    description: article.description,
+    url: article.url,
+    publishedAt: article.publishedAt,
+    source: article.source?.name,
+  }));
+}
+
+/**
+ * Fetch and score news sentiment
  * @param {string} symbol - Stock symbol
  * @returns {Promise<Object>} Sentiment analysis result
  */
 export async function fetchNewsSentiment(symbol) {
+  const key = String(symbol).toUpperCase();
   try {
-    const cacheKey = `sentiment:${symbol}`;
-    
-    // Check cache first (30 min TTL)
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
+    return await cache.getOrSet(`sentiment:${key}`, () => ttlFor('newsSentiment'), async () => {
+      const query = await buildNewsQuery(key);
 
-    if (!config.newsApiKey) {
-      return {
-        score: 0,
-        sentiment: 'neutral',
-        articles: [],
-        note: 'NewsAPI key not configured'
-      };
-    }
+      let articles;
+      let source = 'google-news';
+      try {
+        articles = await fetchGoogleNews(query);
+      } catch (error) {
+        if (!config.newsApiKey) throw error;
+        console.error(`Google News failed (${error.message}), falling back to NewsAPI`);
+        source = 'newsapi';
+        articles = await fetchNewsApi(query);
+      }
 
-    // Fetch news articles
-    const response = await axios.get('https://newsapi.org/v2/everything', {
-      params: {
-        q: symbol,
-        language: 'en',
-        sortBy: 'publishedAt',
-        pageSize: 10,
-        apiKey: config.newsApiKey,
-      },
-      timeout: 5000,
-    });
-
-    if (!response.data || !response.data.articles) {
-      throw new Error('No news data received');
-    }
-
-    const articles = response.data.articles.slice(0, 10);
-    
-    // Analyze sentiment
-    let totalScore = 0;
-    const scoredArticles = articles.map(article => {
-      const text = `${article.title} ${article.description || ''}`.toLowerCase();
-      let score = 0;
-
-      // Count bullish keywords
-      sentimentKeywords.bullish.forEach(keyword => {
-        if (text.includes(keyword)) score += 1;
+      // Analyze sentiment
+      let totalScore = 0;
+      const scoredArticles = articles.map(article => {
+        const score = scoreText(`${article.title} ${article.description || ''}`);
+        totalScore += score;
+        return {
+          ...article,
+          score: score,
+          sentiment: score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral'
+        };
       });
 
-      // Count bearish keywords
-      sentimentKeywords.bearish.forEach(keyword => {
-        if (text.includes(keyword)) score -= 1;
-      });
-
-      totalScore += score;
+      // Normalize score to -1 to 1 range
+      const avgScore = articles.length > 0 ? totalScore / articles.length : 0;
+      const normalizedScore = Math.max(-1, Math.min(1, avgScore / 3));
 
       return {
-        title: article.title,
-        description: article.description,
-        url: article.url,
-        publishedAt: article.publishedAt,
-        source: article.source.name,
-        score: score,
-        sentiment: score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral'
+        symbol: key,
+        query: query,
+        source: source,
+        score: normalizedScore,
+        sentiment: normalizedScore > 0.2 ? 'bullish' : normalizedScore < -0.2 ? 'bearish' : 'neutral',
+        articlesAnalyzed: articles.length,
+        topArticles: scoredArticles.slice(0, 5).map(({ description, ...a }) => (description ? { ...a, description } : a)),
+        timestamp: new Date().toISOString(),
       };
     });
-
-    // Normalize score to -1 to 1 range
-    const avgScore = articles.length > 0 ? totalScore / articles.length : 0;
-    const normalizedScore = Math.max(-1, Math.min(1, avgScore / 3));
-
-    const result = {
-      symbol: symbol,
-      score: normalizedScore,
-      sentiment: normalizedScore > 0.2 ? 'bullish' : normalizedScore < -0.2 ? 'bearish' : 'neutral',
-      articlesAnalyzed: articles.length,
-      topArticles: scoredArticles.slice(0, 3),
-      timestamp: new Date().toISOString(),
-    };
-
-    // Cache the result
-    cache.set(cacheKey, result, config.cacheTTL.newsSentiment);
-
-    return result;
   } catch (error) {
     console.error(`Error fetching news sentiment for ${symbol}:`, error.message);
-    
-    // Return neutral sentiment on error
+
+    // Return neutral sentiment on error (not cached, so the next call retries)
     return {
-      symbol: symbol,
+      symbol: key,
       score: 0,
       sentiment: 'neutral',
       articlesAnalyzed: 0,
@@ -328,10 +381,13 @@ export async function fetchNewsSentiment(symbol) {
  */
 export async function generateSignal(symbol, timeframe = '3mo') {
   try {
-    // Fetch price and OHLC data
+    // MACD(12,26,9) needs ~35 daily bars; 1mo only has ~21, so fetch at least 3mo
+    const dataPeriod = timeframe === '1mo' ? '3mo' : timeframe;
+
+    // Fetch price, OHLC and news in parallel (sentiment never throws)
     const [priceData, ohlcData, sentiment] = await Promise.all([
       fetchLivePrice(symbol),
-      fetchOHLC(symbol, timeframe, '1d'),
+      fetchOHLC(symbol, dataPeriod, '1d'),
       fetchNewsSentiment(symbol)
     ]);
 
